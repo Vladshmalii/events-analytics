@@ -4,7 +4,7 @@ import time
 
 
 @pytest.mark.asyncio
-async def test_ingest_and_query(async_client, setup_database, setup_redis, setup_clickhouse):
+async def test_ingest_and_query(async_client):
     events = []
     for i in range(10):
         events.append({
@@ -15,7 +15,7 @@ async def test_ingest_and_query(async_client, setup_database, setup_redis, setup
             "properties": {"page": "/home"}
         })
 
-    response = await async_client.post("/events", json=events)
+    response = await async_client.post("/events", json={"events": events})
     assert response.status_code == 202
 
     time.sleep(12)
