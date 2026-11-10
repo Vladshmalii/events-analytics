@@ -1,377 +1,160 @@
-# Events Analytics API
+<div align="center">
 
-Сервіс для збору подій (events) та аналітики з підтримкою високої продуктивності та масштабування.
+<img src="https://capsule-render.vercel.app/api?type=rect&color=0:0d1117,100:161b22&height=180&section=header&text=Events%20Analytics&fontSize=40&fontColor=e6edf3&fontAlignY=42&desc=Hot%2Fcold%20event%20pipeline%20with%20idempotent%20ingestion&descSize=15&descColor=8b949e&descAlignY=64" width="100%"/>
 
-## Технологічний стек
+**Idempotent event ingestion and product analytics, backed by PostgreSQL (hot) and ClickHouse (cold).**
 
-- **FastAPI** - веб-фреймворк
-- **PostgreSQL** - дедуплікація та гарячий шар (7 днів)
-- **ClickHouse** - холодний шар та аналітика
-- **Redis** - rate limiting та черга
-- **Celery** - асинхронна обробка подій
-- **Prometheus + Grafana** - метрики та моніторинг
-- **Docker Compose** - оркестрація
+<img src="https://img.shields.io/badge/FastAPI-161b22?style=for-the-badge&logo=fastapi&logoColor=58a6ff"/>
+<img src="https://img.shields.io/badge/PostgreSQL-161b22?style=for-the-badge&logo=postgresql&logoColor=58a6ff"/>
+<img src="https://img.shields.io/badge/ClickHouse-161b22?style=for-the-badge&logo=clickhouse&logoColor=58a6ff"/>
+<img src="https://img.shields.io/badge/Redis-161b22?style=for-the-badge&logo=redis&logoColor=58a6ff"/>
+<img src="https://img.shields.io/badge/Celery-161b22?style=for-the-badge&logo=celery&logoColor=58a6ff"/>
+<img src="https://img.shields.io/badge/Prometheus-161b22?style=for-the-badge&logo=prometheus&logoColor=58a6ff"/>
+<img src="https://img.shields.io/badge/Docker-161b22?style=for-the-badge&logo=docker&logoColor=58a6ff"/>
 
-## Швидкий старт
+</div>
 
-### 1. Клонування та налаштування
+## Overview
 
-```bash
-cd D:\events-analytics
+A service that accepts batches of user events over HTTP, deduplicates them, and serves product analytics (DAU, top events, weekly retention). Writes are acknowledged immediately and processed asynchronously; deduplication lives in PostgreSQL, history lives in ClickHouse. Design rationale is recorded in [`ADR.md`](ADR.md) and [`LEARNED.md`](LEARNED.md) (both in Ukrainian).
+
+## Highlights
+
+- **Fast ack, async write.** `POST /events` validates the batch with Pydantic, enqueues it to Celery over Redis and returns `202 Accepted`.
+- **Idempotent by `event_id`.** Workers check and insert into a PostgreSQL `event_dedup` table (`ON CONFLICT DO NOTHING`), so a replayed event is stored once.
+- **Idempotent CSV import.** `import_events.py` derives a batch key from `sha256(path:size:mtime)` per 1000-event chunk and records it in `batch_dedup`.
+- **Hot/cold split.** PostgreSQL keeps `hot_events`, pruned to a 7-day window by a Celery Beat job; ClickHouse keeps the full history in a monthly-partitioned `MergeTree`.
+- **Buffered ClickHouse inserts.** Workers write through a `Buffer` table in front of `events`, which batches small inserts.
+- **Operability.** Per-IP rate limiting on `/events` (Redis), structured JSON logs (structlog), Prometheus `/metrics`, late-ack Celery tasks.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    C[Client / CSV import] -->|POST /events| A[FastAPI]
+    A -.->|INCR per IP per minute| R[(Redis)]
+    A -->|enqueue batch| R
+    R --> W[Celery worker]
+    W -->|dedup + insert| P[(PostgreSQL<br/>event_dedup, hot_events)]
+    W -->|new events only| B[(ClickHouse<br/>events_buffer)]
+    B --> E[(ClickHouse<br/>events)]
+    BT[Celery Beat, every 24h] -->|delete older than 7 days| P
+    A -->|GET /stats/*| E
 ```
 
-### 2. Запуск інфраструктури
+| Component | Role |
+|---|---|
+| FastAPI (`app/main.py`) | HTTP API, rate-limit and logging middleware, `/metrics`, `/health` |
+| Redis | Celery broker and result backend (db 0 / 1), rate-limit counters |
+| Celery worker (`app/tasks/workers.py`) | Dedup, write to PostgreSQL, forward new events to ClickHouse |
+| Celery Beat | Schedules `cleanup_hot_events` every 86400 s |
+| PostgreSQL | `event_dedup`, `batch_dedup`, `hot_events` (indexed on `occurred_at`, `user_id`) |
+| ClickHouse | `events` (`MergeTree`, `PARTITION BY toYYYYMM(occurred_at)`) and `events_buffer` |
+| Prometheus / Grafana | Prometheus scrapes `api:8000`; Grafana ships without provisioned dashboards |
+
+All `/stats/*` queries read from ClickHouse; the PostgreSQL hot layer is not queried by the API.
+
+## API
+
+| Method | Path | Notes |
+|---|---|---|
+| POST | `/events` | Body `{"events": [{event_id (UUID), occurred_at, user_id, event_type, properties}]}`. Returns `202` `{"status": "accepted", "count": N}`; `429` when rate limited |
+| GET | `/stats/dau` | `from`, `to` (`YYYY-MM-DD`), optional `segment=event_type:<v>` or `segment=properties.<key>:<v>` |
+| GET | `/stats/top-events` | `from`, `to`, `limit` (1-100, default 10) |
+| GET | `/stats/retention` | `start_date`, `windows` (1-12, default 3); returns `week_0` count and `week_1..week_3` percentages |
+| GET | `/health` | Liveness |
+| GET | `/metrics` | Prometheus exposition |
+
+Interactive docs are served at `/docs`.
+
+## Tech stack
+
+| Layer | Technology |
+|---|---|
+| API | FastAPI 0.109, Pydantic 2, Uvicorn |
+| Async work | Celery 5.3 (Redis broker, `acks_late`, JSON serializer) |
+| Hot storage | PostgreSQL 16, SQLAlchemy 2 (asyncpg), Alembic migrations |
+| Cold storage | ClickHouse (`clickhouse-connect`) |
+| Observability | structlog, prometheus-client, Prometheus, Grafana |
+| Tooling | Docker Compose, pytest, pytest-asyncio, httpx |
+
+## Quick start
+
+`docker-compose.yml` loads a `.env` file that is not in the repo (it is git-ignored). Create one pointing at the compose service names:
+
+```bash
+POSTGRES_HOST=postgres
+CLICKHOUSE_HOST=clickhouse
+REDIS_HOST=redis
+CELERY_BROKER_URL=redis://redis:6379/0
+CELERY_RESULT_BACKEND=redis://redis:6379/1
+```
+
+Then:
 
 ```bash
 docker-compose up --build
 ```
 
-Сервіси будуть доступні:
-- API: http://localhost:8000
-- Swagger docs: http://localhost:8000/docs
-- Prometheus: http://localhost:9090
-- Grafana: http://localhost:3000 (admin/admin)
+| Service | URL |
+|---|---|
+| API | http://localhost:8000 (Swagger at `/docs`) |
+| Prometheus | http://localhost:9090 |
+| Grafana | http://localhost:3000 |
 
-### 3. Імпорт тестових даних
+Import a CSV (columns `event_id, occurred_at, user_id, event_type, properties_json`; `*.csv` and `data/` are git-ignored, so supply your own file):
 
 ```bash
 docker-compose exec api python import_events.py /app/data/events.csv
 ```
 
-## API Endpoints
+## Configuration
 
-### Інгест подій
+Read by `app/config.py` (pydantic-settings, `.env` supported). The compose file also sets development credentials for the database containers.
 
-```bash
-POST /events
-Content-Type: application/json
+| Variable | Default |
+|---|---|
+| `POSTGRES_HOST` / `POSTGRES_PORT` | `localhost` / `5432` |
+| `POSTGRES_DB` / `POSTGRES_USER` / `POSTGRES_PASSWORD` | `events_db` / `postgres` / development default |
+| `CLICKHOUSE_HOST` / `CLICKHOUSE_PORT` | `localhost` / `8123` |
+| `CLICKHOUSE_DB` / `CLICKHOUSE_USER` / `CLICKHOUSE_PASSWORD` | `analytics` / `default` / development default |
+| `REDIS_HOST` / `REDIS_PORT` | `localhost` / `6379` |
+| `CELERY_BROKER_URL` / `CELERY_RESULT_BACKEND` | `redis://localhost:6379/0` / `redis://localhost:6379/1` |
+| `RATE_LIMIT_PER_MINUTE` | `1000` (per client IP, `/events` only) |
 
-{
-  "events": [
-    {
-      "event_id": "123e4567-e89b-12d3-a456-426614174000",
-      "occurred_at": "2025-01-15T12:00:00Z",
-      "user_id": "user_123",
-      "event_type": "page_view",
-      "properties": {"page": "/home", "country": "UA"}
-    }
-  ]
-}
+## Project structure
+
+```
+app/
+  api/          events.py, stats.py
+  db/           postgres.py, clickhouse.py, redis_client.py
+  middleware/   rate_limit.py, logging.py
+  models/       Pydantic schemas
+  tasks/        celery_app.py, workers.py
+alembic/        migrations (initial tables, timezone-aware datetimes)
+tests/          conftest.py, test_idempotency.py, test_integration.py
+import_events.py   idempotent CSV importer
+docker-compose.yml, Dockerfile, prometheus.yml
+ADR.md, LEARNED.md
 ```
 
-### Daily Active Users
-
-```bash
-GET /stats/dau?from=2025-01-01&to=2025-01-31
-
-Response:
-[
-  {"date": "2025-01-01", "unique_users": 1523},
-  {"date": "2025-01-02", "unique_users": 1687}
-]
-```
-
-### Top Events
-
-```bash
-GET /stats/top-events?from=2025-01-01&to=2025-01-31&limit=10
-
-Response:
-[
-  {"event_type": "page_view", "count": 15234},
-  {"event_type": "click", "count": 8921}
-]
-```
-
-### Retention
-
-```bash
-GET /stats/retention?start_date=2025-01-01&windows=3
-
-Response:
-[
-  {
-    "cohort_week": "2025-01-06",
-    "week_0": 1000,
-    "week_1": 45.5,
-    "week_2": 32.1,
-    "week_3": 28.7
-  }
-]
-```
-
-### Фільтрація за сегментами
-
-```bash
-GET /stats/dau?from=2025-01-01&to=2025-01-31&segment=properties.country:UA
-GET /stats/dau?from=2025-01-01&to=2025-01-31&segment=event_type:purchase
-```
-
-## Тестування
+## Testing
 
 ```bash
 docker-compose exec api pytest -v
 ```
 
-### Структура тестів
+`tests/test_idempotency.py` posts the same event twice and asserts a single row in ClickHouse. The tests need live PostgreSQL, ClickHouse and Redis plus a running worker, and use fixed sleeps to wait for the buffer flush. The rate-limit test is commented out. `tests/test_integration.py` is currently broken (see below).
 
-- `test_idempotency.py` - перевірка дедуплікації та rate limiting
-- `test_integration.py` - інтеграційний тест інгест → аналітика
+## Status and roadmap
 
-## Бенчмарк
+Working prototype, not production-hardened. Known gaps:
 
-### Методика
-
-1. Імпорт 100,000 подій через CSV
-2. Виміряти час запису
-3. Виконати запит DAU за рік
-4. Виміряти час відповіді
-
-### Результати
-
-**Тестове середовище:**
-- CPU: 8 cores
-- RAM: 16GB
-- SSD
-
-**Інгест:**
-```
-Events: 100,000
-Time: 42s
-Rate: 2,380 events/sec
-Celery workers: 4
-Batch size: 1,000
-```
-
-**Запити:**
-```
-DAU (365 днів): 145ms
-Top Events: 89ms
-Retention (12 тижнів): 234ms
-```
-
-### Вузькі місця
-
-#### 1. ClickHouse INSERT
-**Проблема:** найповільніша операція при масовій вставці
-
-**Рішення:** використання Buffer engine
-```sql
-CREATE TABLE events_buffer AS events
-ENGINE = Buffer(analytics, events, 16, 10, 100, 10000, 1000000, 10000000, 100000000)
-```
-
-**Результат:** +60% швидкість запису
-
-#### 2. PostgreSQL дедуплікація
-**Проблема:** блокування на INSERT при перевірці існування event_id
-
-**Рішення:** ON CONFLICT DO NOTHING замість SELECT перед INSERT
-```python
-INSERT INTO event_dedup (event_id) VALUES (:event_id) ON CONFLICT DO NOTHING
-```
-
-**Результат:** -40% latency P95
-
-#### 3. Celery черга
-**Проблема:** затримка при великих батчах (10k+ events)
-
-**Рішення:** chunking по 1000 подій
-```python
-for chunk in chunks(events, 1000):
-    process_events.delay(chunk)
-```
-
-**Результат:** рівномірне завантаження workers
-
-### Майбутні оптимізації
-
-- **Партіціонування PostgreSQL** по occurred_at (щомісячні партиції)
-- **ClickHouse реплікація** для read-heavy навантаження
-- **Redis Cluster** для rate limiting при масштабуванні
-- **Kafka** замість Redis Queue для >10k events/sec
-- **Materialized views** в ClickHouse для популярних запитів
-
-## Архітектура
-
-### Hot/Cold Storage
-
-**Гарячий шар (PostgreSQL):**
-- Останні 7 днів
-- Швидкий доступ для real-time запитів
-- Автоматична очистка через Celery Beat (щоденно о 03:00)
-
-**Холодний шар (ClickHouse):**
-- Вся історія
-- Колоночне зберігання
-- Партиціонування по місяцях
-- Оптимізовано для аналітики
-
-### Потік даних
-
-```
-POST /events
-    ↓
-Rate Limit Check (Redis)
-    ↓
-Redis Queue (Celery)
-    ↓
-Worker → PostgreSQL (dedup + hot storage)
-       → ClickHouse (cold storage via Buffer)
-    ↓
-GET /stats/* ← ClickHouse Query
-```
-
-### Ідемпотентність
-
-**1. Події** - по `event_id` в PostgreSQL
-```python
-INSERT INTO event_dedup (event_id) VALUES (:event_id) ON CONFLICT DO NOTHING
-```
-
-**2. Батчі CSV** - по hash(filepath + size + mtime)
-```python
-batch_key = hashlib.sha256(f"{filepath}:{size}:{mtime}".encode()).hexdigest()
-INSERT INTO batch_dedup (batch_key) VALUES (:batch_key)
-```
-
-### Rate Limiting
-
-- **Алгоритм:** Token bucket
-- **Ліміт:** 1000 requests/minute на IP
-- **Зберігання:** Redis з TTL 60s
-- **Ключ:** `rate_limit:{ip}:{minute}`
-
-## Моніторинг
-
-### Prometheus метрики
-
-```
-events_received_total - загальна кількість подій
-events_failed_total - помилки обробки
-events_processing_seconds - час обробки (histogram)
-api_request_duration_seconds - latency API (histogram)
-```
-
-### Grafana дашборди
-
-**1. Events Overview**
-- Events/sec
-- Queue size
-- Worker status
-- Error rate
-
-**2. API Performance**
-- Request latency (P50, P95, P99)
-- Throughput
-- Rate limit hits
-
-**3. Database Performance**
-- ClickHouse query duration
-- PostgreSQL connections
-- Redis memory usage
-
-### Логи
-
-Структуровані JSON логи через structlog:
-
-```json
-{
-  "event": "events_queued",
-  "count": 100,
-  "timestamp": "2025-01-15T12:00:00.123Z",
-  "level": "info"
-}
-```
-
-Пошук по логах:
-```bash
-docker-compose logs api | grep "events_queued"
-```
-
-## Безпека
-
-### Валідація
-- Pydantic схеми для всіх endpoints
-- UUID валідація для event_id
-- ISO-8601 datetime валідація
-- JSON schema для properties
-
-### Rate Limiting
-- IP-based обмеження
-- 1000 req/min (можна налаштувати в .env)
-- HTTP 429 при перевищенні
-
-### SQL Injection
-- Параметризовані запити (SQLAlchemy)
-- Підготовлені statements в ClickHouse
-
-## Масштабування
-
-### Горизонтальне
-
-**API:**
-```bash
-docker-compose up --scale api=3
-```
-+ Nginx load balancer
-
-**Workers:**
-```bash
-docker-compose up --scale worker=8
-```
-
-**ClickHouse:**
-- Реплікація (ReplicatedMergeTree)
-- Sharding по user_id
-
-### Вертикальне
-
-**Celery concurrency:**
-```bash
-celery -A app.tasks.celery_app worker --concurrency=8
-```
-
-**Batch size:**
-```python
-CLICKHOUSE_BATCH_SIZE=10000
-```
-
-**Connection pools:**
-```python
-POSTGRES_POOL_SIZE=20
-```
-
-## Troubleshooting
-
-### Worker не обробляє події
-```bash
-docker-compose logs worker
-celery -A app.tasks.celery_app inspect active
-```
-
-### ClickHouse повільні запити
-```sql
-SELECT query, query_duration_ms
-FROM system.query_log
-WHERE query_duration_ms > 1000
-ORDER BY query_duration_ms DESC
-LIMIT 10;
-```
-
-### Redis пам'ять переповнена
-```bash
-docker-compose exec redis redis-cli INFO memory
-docker-compose exec redis redis-cli FLUSHALL
-```
-
-### PostgreSQL deadlocks
-```sql
-SELECT * FROM pg_stat_activity WHERE state = 'active';
-```
-
-## Контакти
-
-- GitHub: [посилання на репозиторій]
-- Документація API: http://localhost:8000/docs
-- Issues: [посилання на issues]
+- **No benchmark in the repo.** The previous README quoted throughput and latency figures, but no benchmark script or test backs them, so they were removed.
+- **Segment filter and date params are interpolated into ClickHouse SQL.** Dates are regex-validated; the `segment` value is not escaped. Needs parameterized queries before any exposure.
+- **Rate limiting** is a fixed-window counter per IP per minute (not a token bucket) and covers only `POST /events`.
+- **Metrics:** only `events_received_total`, `events_failed_total` and `events_processing_seconds` are declared, and the histogram is never observed.
+- **Retention** is computed for fixed week offsets 1-3; `windows` only limits the number of cohorts returned.
+- **Tests:** `test_integration.py` sends a bare list instead of `{"events": [...]}` and requests a non-existent `setup_database` fixture.
+- **Schema** is created at startup via `create_all`; the Alembic migrations are not wired into the startup path.
+- Next: parameterized ClickHouse queries, hot-layer reads, Grafana dashboards, a reproducible benchmark.
