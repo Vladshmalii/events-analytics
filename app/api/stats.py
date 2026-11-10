@@ -22,6 +22,8 @@ async def get_dau(
         logger.info("dau_query", from_date=from_date, to_date=to_date, count=len(result))
         return result
 
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logger.error("dau_query_failed", error=str(e))
         raise HTTPException(status_code=500, detail="Query failed")

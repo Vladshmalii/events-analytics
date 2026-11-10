@@ -68,11 +68,11 @@ def query_dau(from_date: str, to_date: str) -> List[Dict[str, Any]]:
             toDate(occurred_at) as date,
             uniq(user_id) as unique_users
         FROM {settings.clickhouse_db}.events
-        WHERE toDate(occurred_at) BETWEEN '{from_date}' AND '{to_date}'
+        WHERE toDate(occurred_at) BETWEEN {{from_date:Date}} AND {{to_date:Date}}
         GROUP BY date
         ORDER BY date
     """
-    result = client.query(query)
+    result = client.query(query, parameters={"from_date": from_date, "to_date": to_date})
     return [{"date": str(row[0]), "unique_users": row[1]} for row in result.result_rows]
 
 
@@ -83,12 +83,12 @@ def query_top_events(from_date: str, to_date: str, limit: int = 10) -> List[Dict
             event_type,
             count() as count
         FROM {settings.clickhouse_db}.events
-        WHERE toDate(occurred_at) BETWEEN '{from_date}' AND '{to_date}'
+        WHERE toDate(occurred_at) BETWEEN {{from_date:Date}} AND {{to_date:Date}}
         GROUP BY event_type
         ORDER BY count DESC
-        LIMIT {limit}
+        LIMIT {{limit:UInt32}}
     """
-    result = client.query(query)
+    result = client.query(query, parameters={"from_date": from_date, "to_date": to_date, "limit": limit})
     return [{"event_type": row[0], "count": row[1]} for row in result.result_rows]
 
 
@@ -100,14 +100,14 @@ def query_retention(start_date: str, windows: int = 3) -> List[Dict[str, Any]]:
                 user_id,
                 toMonday(toDate(occurred_at)) as cohort_week
             FROM {settings.clickhouse_db}.events
-            WHERE toDate(occurred_at) >= '{start_date}'
+            WHERE toDate(occurred_at) >= {{start_date:Date}}
         ),
         activity AS (
             SELECT DISTINCT
                 user_id,
                 toMonday(toDate(occurred_at)) as activity_week
             FROM {settings.clickhouse_db}.events
-            WHERE toDate(occurred_at) >= '{start_date}'
+            WHERE toDate(occurred_at) >= {{start_date:Date}}
         )
         SELECT
             cohort.cohort_week,
@@ -119,9 +119,9 @@ def query_retention(start_date: str, windows: int = 3) -> List[Dict[str, Any]]:
         LEFT JOIN activity ON cohort.user_id = activity.user_id
         GROUP BY cohort.cohort_week
         ORDER BY cohort.cohort_week
-        LIMIT {windows}
+        LIMIT {{windows:UInt32}}
     """
-    result = client.query(query)
+    result = client.query(query, parameters={"start_date": start_date, "windows": windows})
 
     retention_data = []
     for row in result.result_rows:
@@ -140,15 +140,21 @@ def query_retention(start_date: str, windows: int = 3) -> List[Dict[str, Any]]:
 def query_with_filter(from_date: str, to_date: str, segment: str = None) -> List[Dict[str, Any]]:
     client = get_client()
 
-    where_clause = f"toDate(occurred_at) BETWEEN '{from_date}' AND '{to_date}'"
+    where_clause = "toDate(occurred_at) BETWEEN {from_date:Date} AND {to_date:Date}"
+    params = {"from_date": from_date, "to_date": to_date}
 
     if segment:
-        key, value = segment.split(':')
+        key, sep, value = segment.partition(':')
+        if not sep:
+            raise ValueError("segment must be '<key>:<value>'")
+        params["seg_value"] = value
         if key.startswith('properties.'):
-            prop_key = key.replace('properties.', '')
-            where_clause += f" AND JSONExtractString(properties, '{prop_key}') = '{value}'"
+            params["seg_key"] = key[len('properties.'):]
+            where_clause += " AND JSONExtractString(properties, {seg_key:String}) = {seg_value:String}"
         elif key == 'event_type':
-            where_clause += f" AND event_type = '{value}'"
+            where_clause += " AND event_type = {seg_value:String}"
+        else:
+            raise ValueError("unsupported segment key")
 
     query = f"""
         SELECT 
@@ -160,5 +166,5 @@ def query_with_filter(from_date: str, to_date: str, segment: str = None) -> List
         ORDER BY date
     """
 
-    result = client.query(query)
+    result = client.query(query, parameters=params)
     return [{"date": str(row[0]), "unique_users": row[1]} for row in result.result_rows]
