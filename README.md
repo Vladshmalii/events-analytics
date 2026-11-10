@@ -144,17 +144,16 @@ ADR.md, LEARNED.md
 docker-compose exec api pytest -v
 ```
 
-`tests/test_idempotency.py` posts the same event twice and asserts a single row in ClickHouse. The tests need live PostgreSQL, ClickHouse and Redis plus a running worker, and use fixed sleeps to wait for the buffer flush. The rate-limit test is commented out. `tests/test_integration.py` is currently broken (see below).
+`tests/test_idempotency.py` posts the same event twice and asserts a single row in ClickHouse. The tests need live PostgreSQL, ClickHouse and Redis plus a running worker, and use fixed sleeps to wait for the buffer flush. The rate-limit test is commented out.  `tests/test_segment_injection.py` is a unit test (mock client, no services needed).
 
 ## Status and roadmap
 
 Working prototype, not production-hardened. Known gaps:
 
 - **No benchmark in the repo.** The previous README quoted throughput and latency figures, but no benchmark script or test backs them, so they were removed.
-- **Segment filter and date params are interpolated into ClickHouse SQL.** Dates are regex-validated; the `segment` value is not escaped. Needs parameterized queries before any exposure.
+- **ClickHouse queries use server-side parameter binding** (`{name:Type}`); `segment` is accepted only as `event_type:<v>` or `properties.<key>:<v>` (otherwise `400`). Covered by a mock-client unit test; not run against a live ClickHouse.
 - **Rate limiting** is a fixed-window counter per IP per minute (not a token bucket) and covers only `POST /events`.
 - **Metrics:** only `events_received_total`, `events_failed_total` and `events_processing_seconds` are declared, and the histogram is never observed.
 - **Retention** is computed for fixed week offsets 1-3; `windows` only limits the number of cohorts returned.
-- **Tests:** `test_integration.py` sends a bare list instead of `{"events": [...]}` and requests a non-existent `setup_database` fixture.
 - **Schema** is created at startup via `create_all`; the Alembic migrations are not wired into the startup path.
-- Next: parameterized ClickHouse queries, hot-layer reads, Grafana dashboards, a reproducible benchmark.
+- Next: hot-layer reads, Grafana dashboards, a reproducible benchmark.
